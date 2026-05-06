@@ -1,6 +1,12 @@
 LogBlueprintUserMessages: [凸包转模型简模用_C_1] """
-UE 5.5 - 关卡 Actor 凸包替换工具 v7
+UE 5.5 - 关卡 Actor 凸包替换工具 v8
 =====================================
+v8 修复内容：
+  [Fix Bug1] build_convex_only_fbx: UCX_ 全局替换改为精确替换，修复 FBX Connections 断裂
+  [Fix Bug2] has_open_brace=False 分支: depth 从实际括号差值初始化，修复深度偏移
+  [Fix Bug3] ensure_convex_collision: count<0 加错误日志并 save+retry
+  [Fix Bug4] import_fbx: 导入前卸载已有资产，导入后处理路径偏移(_1)并重命名
+v8 新增：FORCE_RECREATE / FORCE_HULL_REGEN 强制重建开关
 核心修复：原始 Geometry 替换为微型占位三角形 + 去掉 UCX_ 前缀
          → FBX 结构 100% 完整 → 导入只显示凸包几何体
 流程：选中模型 → 检测/创建凸包简模 → 扫描关卡 → 替换 Actor
@@ -11,9 +17,13 @@ import re
 import tempfile
 # ========== 配置 ==========
 SUFFIX = "_Convex"
-AUTO_HULL_COUNT = 4
-AUTO_MAX_HULL_VERTS = 32
-AUTO_HULL_PRECISION = 100000
+AUTO_HULL_COUNT     = 4       # 凸包数量
+AUTO_MAX_HULL_VERTS = 32      # 最大顶点数
+AUTO_HULL_PRECISION = 100000  # 凸包精度
+
+FORCE_RECREATE   = False  # True → 删除旧 _Convex 资产并按新参数重建
+FORCE_HULL_REGEN = False  # True → 先删除旧凸包再用新参数重新分解
+
 TEMP_DIR = os.path.join(tempfile.gettempdir(), "ue5_convex_extract")
 os.makedirs(TEMP_DIR, exist_ok=True)
 # ================================================================
@@ -78,10 +88,24 @@ def ensure_convex_collision(static_mesh):
     sm_sub = unreal.get_editor_subsystem(unreal.StaticMeshEditorSubsystem)
     count = sm_sub.get_convex_collision_count(static_mesh)
     if count > 0:
-        unreal.log(f"  ✓ 已有 {count} 个凸包碰撞体")
-        return (count, False)
+        # [Fix v8] FORCE_HULL_REGEN: 先删除旧凸包再用新参数重新分解
+        if FORCE_HULL_REGEN:
+            unreal.log(f"  FORCE_HULL_REGEN=True, 删除旧凸包 ({count} 个) 并重新生成...")
+            sm_sub.remove_collisions(static_mesh)
+        else:
+            unreal.log(f"  ✓ 已有 {count} 个凸包碰撞体")
+            return (count, False)
+    # [Fix Bug3] count < 0 时加错误日志，save+retry
     if count < 0:
-        return (0, False)
+        unreal.log_error(f"  get_convex_collision_count 返回异常值 {count}，尝试保存后重试...")
+        try:
+            unreal.EditorAssetLibrary.save_asset(static_mesh.get_path_name())
+        except Exception:
+            pass
+        count = sm_sub.get_convex_collision_count(static_mesh)
+        if count < 0:
+            unreal.log_error(f"  get_convex_collision_count 返回异常值 {count}，跳过该模型")
+            return (0, False)
     unreal.log(f"  ✗ 无凸包碰撞体，自动创建中...")
     ok = sm_sub.set_convex_decomposition_collisions(
         static_mesh, AUTO_HULL_COUNT, AUTO_MAX_HULL_VERTS, AUTO_HULL_PRECISION
@@ -170,9 +194,11 @@ def build_convex_only_fbx(source_fbx, output_fbx):
                     i += 1
                 if i < total:
                     output.append(lines[i])  # { 行
+                    # [Fix Bug2] 从实际括号差值初始化 depth，而不是硬编码 depth = 1
+                    # 用 max(1, ...) 确保 depth 至少为 1，防止畸形行提前退出
+                    depth = max(1, lines[i].count('{') - lines[i].count('}'))
                     i += 1
                 # 现在跳过块内所有内容直到匹配的 }
-                depth = 1
                 while i < total and depth > 0:
                     depth += lines[i].count('{') - lines[i].count('}')
                     i += 1
@@ -199,8 +225,13 @@ def build_convex_only_fbx(source_fbx, output_fbx):
             replaced_count += 1
             unreal.log(f"  已掏空原始 Geometry 块 (第 {replaced_count} 个)")
             continue
-        # ── 其他所有行：保留原样，但去掉 UCX_ 前缀 ──
-        output.append(lines[i].replace('UCX_', ''))
+        # ── 其他所有行：保留原样，但精确替换节点声明中的 UCX_ 前缀 ──
+        # [Fix Bug1] 只替换 "Mesh::UCX_ 和 "Model::UCX_ 两种模式，
+        # 避免全局替换破坏 FBX Connections 区段的名称引用
+        line = lines[i]
+        line = line.replace('"Mesh::UCX_', '"Mesh::')
+        line = line.replace('"Model::UCX_', '"Model::')
+        output.append(line)
         i += 1
     if replaced_count == 0:
         unreal.log_warning(f"  未找到非 UCX_ 的 Geometry 块")
@@ -214,6 +245,15 @@ def build_convex_only_fbx(source_fbx, output_fbx):
 #  FBX 导入
 # ================================================================
 def import_fbx(fbx_path, dest_path, asset_name):
+    full_path = f"{dest_path}/{asset_name}"
+    # [Fix Bug4] 导入前尝试卸载已有资产，避免 replace_existing 静默创建 _Convex_1
+    if unreal.EditorAssetLibrary.does_asset_exist(full_path):
+        try:
+            pkg_names = [full_path]
+            unreal.EditorLoadingAndSavingUtils.unload_packages(pkg_names)
+            unreal.log(f"  已卸载旧资产: {full_path}")
+        except Exception as e:
+            unreal.log(f"  卸载旧资产失败（忽略）: {e}")
     task = unreal.AssetImportTask()
     task.set_editor_property("filename", fbx_path)
     task.set_editor_property("destination_path", dest_path)
@@ -232,17 +272,33 @@ def import_fbx(fbx_path, dest_path, asset_name):
     sm_data.set_editor_property("generate_lightmap_u_vs", False)
     task.set_editor_property("options", options)
     unreal.AssetToolsHelpers.get_asset_tools().import_asset_tasks([task])
-    full_path = f"{dest_path}/{asset_name}"
     if unreal.EditorAssetLibrary.does_asset_exist(full_path):
         unreal.log(f"  ✅ 导入成功: {full_path}")
         return True
+    # [Fix Bug4] 检查实际导入路径（防止 replace_existing 静默创建 _Convex_1）
     try:
         imported = task.get_editor_property("imported_object_paths")
         if imported and len(imported) > 0:
-            unreal.log(f"  ✅ 导入: {list(imported)}")
-            return True
-    except:
-        pass
+            actual_path = list(imported)[0]
+            # 去掉 .AssetName 后缀（UE 返回格式为 /Path/Asset.Asset）
+            if '.' in actual_path:
+                actual_path = actual_path.rsplit('.', 1)[0]
+            if actual_path != full_path:
+                unreal.log(f"  导入路径偏移: {actual_path}，尝试重命名为: {full_path}")
+                try:
+                    ok = unreal.EditorAssetLibrary.rename_asset(actual_path, full_path)
+                    if ok:
+                        unreal.log(f"  ✅ 重命名成功: {full_path}")
+                        return True
+                    else:
+                        unreal.log_error(f"  重命名失败，实际资产位于: {actual_path}")
+                except Exception as e:
+                    unreal.log_error(f"  重命名异常: {e}")
+            else:
+                unreal.log(f"  ✅ 导入成功: {actual_path}")
+                return True
+    except Exception as e:
+        unreal.log(f"  获取 imported_object_paths 失败（忽略）: {e}")
     unreal.log_warning(f"  ⚠ 请检查内容浏览器: {dest_path}")
     return False
 # ================================================================
@@ -292,10 +348,15 @@ def get_or_create_convex_mesh(static_mesh):
     pkg = get_asset_package_path(static_mesh)
     convex_path = f"{pkg}/{name}{SUFFIX}"
     if unreal.EditorAssetLibrary.does_asset_exist(convex_path):
-        unreal.log(f"  ✓ 已有凸包简模: {convex_path}")
-        mesh = unreal.EditorAssetLibrary.load_asset(convex_path)
-        if mesh and isinstance(mesh, unreal.StaticMesh):
-            return (mesh, False)
+        # [Fix v8] FORCE_RECREATE: 删除旧资产并强制重建
+        if FORCE_RECREATE:
+            unreal.log(f"  FORCE_RECREATE=True, 删除旧资产: {convex_path}")
+            unreal.EditorAssetLibrary.delete_asset(convex_path)
+        else:
+            unreal.log(f"  ✓ 已有凸包简模: {convex_path}")
+            mesh = unreal.EditorAssetLibrary.load_asset(convex_path)
+            if mesh and isinstance(mesh, unreal.StaticMesh):
+                return (mesh, False)
     result_path = create_convex_mesh(static_mesh)
     if result_path:
         mesh = unreal.EditorAssetLibrary.load_asset(result_path)
@@ -382,11 +443,13 @@ def main():
         unreal.log_error("❌ 请先在内容浏览器中选中至少一个 StaticMesh！")
         return
     unreal.log("╔══════════════════════════════════════════════════════╗")
-    unreal.log("║  凸包替换工具 v7 (UE 5.5)                           ║")
+    unreal.log("║  凸包替换工具 v8 (UE 5.5)                           ║")
     unreal.log("║  ★ 只保留凸包几何体，去掉源模型                      ║")
     unreal.log("║  检测已有简模 → 无则创建 → 扫描关卡 → 替换 Actor     ║")
     unreal.log("║  Ctrl+Z 撤销 | 保留 Transform/材质                  ║")
     unreal.log("╚══════════════════════════════════════════════════════╝")
+    unreal.log(f"[v8] 当前配置: HULL_COUNT={AUTO_HULL_COUNT}, MAX_VERTS={AUTO_MAX_HULL_VERTS}, "
+               f"PRECISION={AUTO_HULL_PRECISION}, FORCE_RECREATE={FORCE_RECREATE}, FORCE_HULL_REGEN={FORCE_HULL_REGEN}")
     unreal.log(f"选中 {len(meshes)} 个 | 后缀: {SUFFIX}")
     total_replaced = 0
     total_failed = 0
