@@ -1,0 +1,408 @@
+LogBlueprintUserMessages: [凸包转模型简模用_C_1] """
+UE 5.5 - 关卡 Actor 凸包替换工具 v7
+=====================================
+核心修复：原始 Geometry 替换为微型占位三角形 + 去掉 UCX_ 前缀
+         → FBX 结构 100% 完整 → 导入只显示凸包几何体
+流程：选中模型 → 检测/创建凸包简模 → 扫描关卡 → 替换 Actor
+"""
+import unreal
+import os
+import re
+import tempfile
+# ========== 配置 ==========
+SUFFIX = "_Convex"
+AUTO_HULL_COUNT = 4
+AUTO_MAX_HULL_VERTS = 32
+AUTO_HULL_PRECISION = 100000
+TEMP_DIR = os.path.join(tempfile.gettempdir(), "ue5_convex_extract")
+os.makedirs(TEMP_DIR, exist_ok=True)
+# ================================================================
+#  工具函数
+# ================================================================
+def get_asset_name(asset):
+    try:
+        return unreal.SystemLibrary.get_object_name(asset)
+    except:
+        path = str(asset.get_path_name())
+        return path.split('.')[-1] if '.' in path else path.rsplit('/', 1)[-1]
+def get_asset_package_path(asset):
+    try:
+        path = unreal.SystemLibrary.get_path_name(asset)
+    except:
+        path = str(asset.get_path_name())
+    if '.' in path:
+        path = path.split('.')[0]
+    return path.rsplit('/', 1)[0]
+def get_full_asset_path(asset):
+    pkg = get_asset_package_path(asset)
+    name = get_asset_name(asset)
+    return f"{pkg}/{name}"
+def get_selected_static_meshes():
+    try:
+        selected = unreal.EditorUtilityLibrary.get_selected_assets()
+        return [a for a in selected if isinstance(a, unreal.StaticMesh)]
+    except:
+        try:
+            sub = unreal.get_editor_subsystem(unreal.EditorAssetSubsystem)
+            selected = sub.get_selected_assets()
+            return [a for a in selected if isinstance(a, unreal.StaticMesh)]
+        except:
+            return []
+# ================================================================
+#  碰撞复杂度
+# ================================================================
+def check_and_fix_collision_complexity(static_mesh):
+    complexity = unreal.get_editor_subsystem(
+        unreal.StaticMeshEditorSubsystem
+    ).get_collision_complexity(static_mesh)
+    if complexity == unreal.CollisionTraceFlag.CTF_USE_COMPLEX_AS_SIMPLE:
+        unreal.log(f"  ⚠ 'Complex As Simple' → 临时改为 'Project Default'")
+        body_setup = static_mesh.get_editor_property("body_setup")
+        if body_setup:
+            body_setup.set_editor_property(
+                "collision_trace_flag",
+                unreal.CollisionTraceFlag.CTF_USE_DEFAULT
+            )
+        return (True, complexity)
+    return (False, None)
+def restore_collision_complexity(static_mesh, original):
+    if original is None:
+        return
+    body_setup = static_mesh.get_editor_property("body_setup")
+    if body_setup:
+        body_setup.set_editor_property("collision_trace_flag", original)
+# ================================================================
+#  凸包检测与创建
+# ================================================================
+def ensure_convex_collision(static_mesh):
+    sm_sub = unreal.get_editor_subsystem(unreal.StaticMeshEditorSubsystem)
+    count = sm_sub.get_convex_collision_count(static_mesh)
+    if count > 0:
+        unreal.log(f"  ✓ 已有 {count} 个凸包碰撞体")
+        return (count, False)
+    if count < 0:
+        return (0, False)
+    unreal.log(f"  ✗ 无凸包碰撞体，自动创建中...")
+    ok = sm_sub.set_convex_decomposition_collisions(
+        static_mesh, AUTO_HULL_COUNT, AUTO_MAX_HULL_VERTS, AUTO_HULL_PRECISION
+    )
+    if not ok:
+        unreal.log_error(f"  自动创建失败!")
+        return (0, False)
+    count = sm_sub.get_convex_collision_count(static_mesh)
+    unreal.log(f"  ✓ 自动创建成功: {count} 个凸包")
+    return (count, True)
+# ================================================================
+#  FBX 导出
+# ================================================================
+def export_fbx_ascii(static_mesh, fbx_path):
+    task = unreal.AssetExportTask()
+    task.set_editor_property("object", static_mesh)
+    task.set_editor_property("filename", fbx_path)
+    task.set_editor_property("automated", True)
+    task.set_editor_property("prompt", False)
+    task.set_editor_property("replace_identical", True)
+    options = unreal.FbxExportOption()
+    options.set_editor_property("collision", True)
+    options.set_editor_property("ascii", True)
+    task.set_editor_property("options", options)
+    task.set_editor_property("exporter", unreal.StaticMeshExporterFBX())
+    ok = unreal.Exporter.run_asset_export_task(task)
+    if ok and os.path.exists(fbx_path):
+        unreal.log(f"  FBX 导出成功 ({os.path.getsize(fbx_path)/1024:.1f} KB)")
+        return True
+    unreal.log_error(f"  FBX 导出失败!")
+    return False
+# ================================================================
+#  ★ 核心：掏空原始网格 + 去掉碰撞前缀 → 只剩凸包
+# ================================================================
+def skip_brace_block(lines, start_idx):
+    """
+    从 start_idx 行开始，跳过一个完整的 { } 块（含嵌套）
+    返回：闭合 } 所在行的下一行索引
+    """
+    depth = 0
+    i = start_idx
+    while i < len(lines):
+        depth += lines[i].count('{') - lines[i].count('}')
+        i += 1
+        if depth <= 0:
+            return i
+    return i
+def build_convex_only_fbx(source_fbx, output_fbx):
+    """
+    从导出的 ASCII FBX 中：
+    1. 找到非 UCX_ 的 Geometry 块 → 用微型占位三角形替换其内容
+    2. 全局去掉 UCX_ 前缀 → 碰撞网格变成普通可见网格
+    3. FBX 的 Definitions / Connections / Materials 完全不动
+    
+    结果：
+    - 原始可见网格 → 微型三角形（肉眼不可见，但 FBX 结构合法）
+    - 碰撞网格 → 去掉 UCX_ 后变成可见网格
+    - combine_meshes=True 导入 → 微型三角形 + 凸包合并 ≈ 纯凸包
+    """
+    with open(source_fbx, 'r', encoding='utf-8', errors='ignore') as f:
+        lines = f.readlines()
+    total = len(lines)
+    output = []
+    i = 0
+    replaced_count = 0
+    while i < total:
+        stripped = lines[i].strip()
+        # 检测：非 UCX_ 的 Geometry: ... "Mesh" 块
+        is_original_geometry = (
+            stripped.startswith('Geometry:')
+            and '"Mesh"' in stripped
+            and 'UCX_' not in stripped
+        )
+        if is_original_geometry:
+            # ── 找到原始可见网格的 Geometry 块 ──
+            # 保留头行（含 Geometry ID 和名称），替换块内容
+            header_line = lines[i]
+            output.append(header_line)  # 保留 Geometry: ID, "Name", "Mesh" {
+            # 头行可能包含 { 也可能不包含
+            has_open_brace = '{' in header_line
+            if not has_open_brace:
+                # 找到 { 所在行
+                i += 1
+                while i < total and '{' not in lines[i]:
+                    output.append(lines[i])
+                    i += 1
+                if i < total:
+                    output.append(lines[i])  # { 行
+                    i += 1
+                # 现在跳过块内所有内容直到匹配的 }
+                depth = 1
+                while i < total and depth > 0:
+                    depth += lines[i].count('{') - lines[i].count('}')
+                    i += 1
+            else:
+                # { 在头行中，计算头行的深度
+                depth = header_line.count('{') - header_line.count('}')
+                i += 1
+                # 跳过块内所有内容直到匹配的 }
+                while i < total and depth > 0:
+                    depth += lines[i].count('{') - lines[i].count('}')
+                    i += 1
+            # 写入微型占位几何体（合法的最小 FBX Geometry 内容）
+            # 3 个顶点组成一个微小三角形
+            output.append('\tProperties70:  {\n')
+            output.append('\t}\n')
+            output.append('\tVertices: *9 {\n')
+            output.append('\t\ta: 0,0,0,0.001,0,0,0,0.001,0\n')
+            output.append('\t}\n')
+            output.append('\tPolygonVertexIndex: *3 {\n')
+            output.append('\t\ta: 0,1,-3\n')
+            output.append('\t}\n')
+            output.append('\tGeometryVersion: 124\n')
+            output.append('}\n')
+            replaced_count += 1
+            unreal.log(f"  已掏空原始 Geometry 块 (第 {replaced_count} 个)")
+            continue
+        # ── 其他所有行：保留原样，但去掉 UCX_ 前缀 ──
+        output.append(lines[i].replace('UCX_', ''))
+        i += 1
+    if replaced_count == 0:
+        unreal.log_warning(f"  未找到非 UCX_ 的 Geometry 块")
+    # 写入
+    with open(output_fbx, 'w', encoding='utf-8') as f:
+        f.writelines(output)
+    unreal.log(f"  ✅ 凸包 FBX 生成: 掏空 {replaced_count} 个原始 Geometry, "
+               f"UCX_ 前缀已去除 ({os.path.getsize(output_fbx)/1024:.1f} KB)")
+    return True
+# ================================================================
+#  FBX 导入
+# ================================================================
+def import_fbx(fbx_path, dest_path, asset_name):
+    task = unreal.AssetImportTask()
+    task.set_editor_property("filename", fbx_path)
+    task.set_editor_property("destination_path", dest_path)
+    task.set_editor_property("destination_name", asset_name)
+    task.set_editor_property("replace_existing", True)
+    task.set_editor_property("automated", True)
+    task.set_editor_property("save", True)
+    options = unreal.FbxImportUI()
+    options.set_editor_property("import_mesh", True)
+    options.set_editor_property("import_materials", False)
+    options.set_editor_property("import_textures", False)
+    options.set_editor_property("import_as_skeletal", False)
+    sm_data = options.get_editor_property("static_mesh_import_data")
+    sm_data.set_editor_property("combine_meshes", True)
+    sm_data.set_editor_property("auto_generate_collision", False)
+    sm_data.set_editor_property("generate_lightmap_u_vs", False)
+    task.set_editor_property("options", options)
+    unreal.AssetToolsHelpers.get_asset_tools().import_asset_tasks([task])
+    full_path = f"{dest_path}/{asset_name}"
+    if unreal.EditorAssetLibrary.does_asset_exist(full_path):
+        unreal.log(f"  ✅ 导入成功: {full_path}")
+        return True
+    try:
+        imported = task.get_editor_property("imported_object_paths")
+        if imported and len(imported) > 0:
+            unreal.log(f"  ✅ 导入: {list(imported)}")
+            return True
+    except:
+        pass
+    unreal.log_warning(f"  ⚠ 请检查内容浏览器: {dest_path}")
+    return False
+# ================================================================
+#  创建凸包简模
+# ================================================================
+def create_convex_mesh(static_mesh):
+    """创建纯凸包简模，返回资产路径或 None"""
+    name = get_asset_name(static_mesh)
+    pkg = get_asset_package_path(static_mesh)
+    new_name = name + SUFFIX
+    unreal.log(f"\n  ── 创建凸包简模: {new_name} ──")
+    need_restore, orig_complexity = (False, None)
+    was_auto = False
+    try:
+        need_restore, orig_complexity = check_and_fix_collision_complexity(static_mesh)
+        convex_count, was_auto = ensure_convex_collision(static_mesh)
+        if convex_count <= 0:
+            return None
+        # 导出
+        fbx_src = os.path.join(TEMP_DIR, f"{name}_export.fbx")
+        if not export_fbx_ascii(static_mesh, fbx_src):
+            return None
+        # 掏空原始网格 + 去掉 UCX_
+        fbx_out = os.path.join(TEMP_DIR, f"{new_name}.fbx")
+        if not build_convex_only_fbx(fbx_src, fbx_out):
+            return None
+        # 导入
+        if import_fbx(fbx_out, pkg, new_name):
+            return f"{pkg}/{new_name}"
+        return None
+    finally:
+        if need_restore:
+            restore_collision_complexity(static_mesh, orig_complexity)
+        if was_auto:
+            sm_sub = unreal.get_editor_subsystem(unreal.StaticMeshEditorSubsystem)
+            sm_sub.remove_collisions(static_mesh)
+        unreal.log(f"  ✓ 原模型未保存修改")
+# ================================================================
+#  获取或创建凸包简模
+# ================================================================
+def get_or_create_convex_mesh(static_mesh):
+    """
+    检查同目录是否已有 _Convex → 有则直接用，无则创建
+    返回 (convex_mesh, was_created) 或 (None, False)
+    """
+    name = get_asset_name(static_mesh)
+    pkg = get_asset_package_path(static_mesh)
+    convex_path = f"{pkg}/{name}{SUFFIX}"
+    if unreal.EditorAssetLibrary.does_asset_exist(convex_path):
+        unreal.log(f"  ✓ 已有凸包简模: {convex_path}")
+        mesh = unreal.EditorAssetLibrary.load_asset(convex_path)
+        if mesh and isinstance(mesh, unreal.StaticMesh):
+            return (mesh, False)
+    result_path = create_convex_mesh(static_mesh)
+    if result_path:
+        mesh = unreal.EditorAssetLibrary.load_asset(result_path)
+        if mesh and isinstance(mesh, unreal.StaticMesh):
+            return (mesh, True)
+    return (None, False)
+# ================================================================
+#  关卡扫描 & 替换
+# ================================================================
+def find_actors_using_mesh(static_mesh):
+    """扫描当前关卡，找所有使用指定模型的 Actor + Component"""
+    source_path = get_full_asset_path(static_mesh)
+    results = []
+    editor_sub = unreal.get_editor_subsystem(unreal.EditorActorSubsystem)
+    all_actors = editor_sub.get_all_level_actors()
+    for actor in all_actors:
+        components = actor.get_components_by_class(unreal.StaticMeshComponent)
+        for comp in components:
+            mesh = comp.static_mesh
+            if mesh is None:
+                continue
+            if get_full_asset_path(mesh) == source_path:
+                results.append((actor, comp))
+    return results
+def replace_actor_mesh(actor, component, new_mesh):
+    """替换组件的 StaticMesh，保留 Transform 和材质覆盖"""
+    actor_name = ""
+    try:
+        actor_name = unreal.SystemLibrary.get_object_name(actor)
+    except:
+        actor_name = str(actor.get_fname())
+    # 记录材质
+    override_mats = []
+    num_mats = component.get_num_materials()
+    for idx in range(num_mats):
+        override_mats.append(component.get_material(idx))
+    # 替换模型
+    component.set_static_mesh(new_mesh)
+    # 恢复材质
+    for idx, mat in enumerate(override_mats):
+        if mat is not None and idx < component.get_num_materials():
+            component.set_material(idx, mat)
+    return actor_name
+# ================================================================
+#  主流程
+# ================================================================
+def process_one_source_mesh(static_mesh):
+    name = get_asset_name(static_mesh)
+    pkg = get_asset_package_path(static_mesh)
+    unreal.log(f"\n{'═'*60}")
+    unreal.log(f"  源模型: {name}")
+    unreal.log(f"  路径:   {pkg}")
+    unreal.log(f"{'═'*60}")
+    # 1. 获取/创建凸包简模
+    convex_mesh, was_created = get_or_create_convex_mesh(static_mesh)
+    if convex_mesh is None:
+        unreal.log_error(f"  ❌ 凸包简模创建失败")
+        return (0, 0)
+    status = "新创建" if was_created else "已有"
+    unreal.log(f"  ✓ 凸包简模 ({status}): {get_asset_name(convex_mesh)}")
+    # 2. 扫描关卡
+    actors = find_actors_using_mesh(static_mesh)
+    if not actors:
+        unreal.log(f"  当前关卡中没有使用 {name} 的 Actor")
+        return (0, 0)
+    unreal.log(f"  找到 {len(actors)} 个 Actor/组件")
+    # 3. 替换（支持 Ctrl+Z 撤销）
+    replaced = 0
+    failed = 0
+    with unreal.ScopedEditorTransaction("Replace With Convex") as trans:
+        for actor, comp in actors:
+            try:
+                aname = replace_actor_mesh(actor, comp, convex_mesh)
+                replaced += 1
+                unreal.log(f"    ✓ {aname}")
+            except Exception as e:
+                failed += 1
+                unreal.log_error(f"    ✗ {e}")
+    unreal.log(f"  替换: {replaced} 成功, {failed} 失败")
+    return (replaced, failed)
+def main():
+    meshes = get_selected_static_meshes()
+    if not meshes:
+        unreal.log_error("❌ 请先在内容浏览器中选中至少一个 StaticMesh！")
+        return
+    unreal.log("╔══════════════════════════════════════════════════════╗")
+    unreal.log("║  凸包替换工具 v7 (UE 5.5)                           ║")
+    unreal.log("║  ★ 只保留凸包几何体，去掉源模型                      ║")
+    unreal.log("║  检测已有简模 → 无则创建 → 扫描关卡 → 替换 Actor     ║")
+    unreal.log("║  Ctrl+Z 撤销 | 保留 Transform/材质                  ║")
+    unreal.log("╚══════════════════════════════════════════════════════╝")
+    unreal.log(f"选中 {len(meshes)} 个 | 后缀: {SUFFIX}")
+    total_replaced = 0
+    total_failed = 0
+    with unreal.ScopedSlowTask(len(meshes), "处理中...") as slow_task:
+        slow_task.make_dialog(True)
+        for mesh in meshes:
+            if slow_task.should_cancel():
+                break
+            slow_task.enter_progress_frame(1, f"处理: {get_asset_name(mesh)}")
+            r, f = process_one_source_mesh(mesh)
+            total_replaced += r
+            total_failed += f
+    unreal.log(f"\n{'═'*60}")
+    unreal.log(f"  完成! 替换: {total_replaced} 成功, {total_failed} 失败")
+    unreal.log(f"  Ctrl+Z 可撤销全部替换")
+    unreal.log(f"{'═'*60}")
+main()
+LogDerivedDataCache: C:/Users/uezfl/AppData/Local/UnrealEngine/Common/DerivedDataCache: Maintenance finished in +00:00:00.172 and deleted 0 files with total size 0 MiB and 0 empty folders. Scanned 855 files in 1407 folders with total size 100 MiB.
+LogUObjectHash: Compacting FUObjectHashTables data took   0.83ms
