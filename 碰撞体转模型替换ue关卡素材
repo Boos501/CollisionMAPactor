@@ -1,18 +1,3 @@
-"""
-UE 5.5 - 关卡 Actor 凸包替换工具 v9
-=====================================
-v8 修复：
-  [Bug1] UCX_ 精确替换，防止 FBX Connections 引用断裂
-  [Bug2] has_open_brace=False 分支深度计算修正
-  [Bug3] get_convex_collision_count < 0 静默失败改为明确报错
-  [Bug4] 导入后从 imported_object_paths 取实际路径，自动处理 _1 冲突
-v9 改动：
-  直接扫描当前关卡所有 StaticMeshActor，自动收集唯一源网格，无需手动选中
-  支持"仅处理视口中选中的 Actor"模式（SELECTED_ONLY = True）
-  FORCE_RECREATE / FORCE_HULL_REGEN 参数开关
-  启动时打印当前配置
-流程：扫描关卡 Actor → 收集唯一网格 → 创建凸包简模 → 替换 Actor
-"""
 import unreal
 import os
 import re
