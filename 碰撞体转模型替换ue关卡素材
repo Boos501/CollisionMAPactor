@@ -13,6 +13,13 @@ SELECTED_ONLY    = False  # True → 只处理视口中当前选中的 Actor；F
 FORCE_RECREATE   = False  # True → 删除旧 _Convex 资产，按当前参数重建
 FORCE_HULL_REGEN = False  # True → 删除旧凸包，按当前参数重新分解
 
+# v10 新增
+FLIP_NORMALS       = True  # True → 反转凸包网格法线（解决内表面问题）  # [v10 新增]
+EXPORT_MESH_FORMAT = ""    # "" / "fbx" / "obj" → 额外导出简模文件      # [v10 新增]
+EXPORT_MESH_DIR    = ""    # 留空使用系统 TEMP 目录                      # [v10 新增]
+EXPORT_ABC         = False # True → 额外导出 ABC 单帧                    # [v10 新增]
+EXPORT_ABC_DIR     = ""    # 留空使用系统 TEMP 目录                      # [v10 新增]
+
 TEMP_DIR = os.path.join(tempfile.gettempdir(), "ue5_convex_extract")
 os.makedirs(TEMP_DIR, exist_ok=True)
 
@@ -174,6 +181,129 @@ _UCX_PATTERN = re.compile(r'("(?:Mesh|Model)::)UCX_')
 def _strip_ucx_prefix(line):
     return _UCX_PATTERN.sub(r'\1', line)
 
+# ----------------------------------------------------------------
+#  [Fix Normals] 法线反转辅助函数
+# ----------------------------------------------------------------
+def _flip_poly_winding_data(data_str):
+    """[Fix Normals] 反转 PolygonVertexIndex 数据中每个多边形的顶点绕序。
+    FBX 以负数索引 (-n-1) 标记多边形结束，保持首顶点不变，颠倒其余顶点顺序。"""
+    indices = []
+    for x in data_str.split(','):
+        x = x.strip()
+        if x:
+            indices.append(int(x))
+
+    flipped = []
+    current_poly = []
+    for idx in indices:
+        current_poly.append(idx)
+        if idx < 0:  # 多边形结束标志
+            actual_last = -idx - 1
+            actual = current_poly[:-1] + [actual_last]
+            if len(actual) >= 2:
+                # 保持首顶点，颠倒其余顶点顺序
+                flipped_actual = [actual[0]] + list(reversed(actual[1:]))
+            else:
+                flipped_actual = actual
+            new_end = flipped_actual[-1]
+            new_poly = flipped_actual[:-1] + [-new_end - 1]
+            flipped.extend(new_poly)
+            current_poly = []
+    if current_poly:  # 不完整的多边形直接保留
+        flipped.extend(current_poly)
+
+    return ','.join(str(x) for x in flipped)
+
+def _negate_normals_data(data_str):
+    """[Fix Normals] 对法线数据的每个浮点数取反（乘以 -1）。"""
+    parts = []
+    for x in data_str.split(','):
+        x = x.strip()
+        if not x:
+            continue
+        try:
+            v = float(x)
+            if v == 0.0:
+                parts.append(x)          # 零值保留原始写法
+            elif x.startswith('-'):
+                parts.append(x[1:])      # 去掉负号
+            else:
+                parts.append('-' + x)    # 加上负号
+        except ValueError:
+            parts.append(x)
+    return ','.join(parts)
+
+def _flip_normals_in_ucx_block(block_lines):
+    """[Fix Normals] 遍历 UCX_ 几何块的各行，反转绕序并取反法线数组。"""
+    result = []
+    j = 0
+    total_b = len(block_lines)
+
+    while j < total_b:
+        line = block_lines[j]
+        stripped = line.strip()
+
+        # [Fix Normals] 反转 PolygonVertexIndex 绕序
+        if stripped.startswith('PolygonVertexIndex:'):
+            result.append(line)
+            j += 1
+            depth = line.count('{') - line.count('}')
+            # 若开括号不在同一行，继续查找
+            while j < total_b and depth == 0 and '{' not in block_lines[j]:
+                result.append(block_lines[j])
+                j += 1
+            if j < total_b and depth == 0:
+                result.append(block_lines[j])
+                depth = block_lines[j].count('{') - block_lines[j].count('}')
+                j += 1
+            # 处理数据行直到块结束
+            while j < total_b and depth > 0:
+                inner = block_lines[j]
+                inner_s = inner.strip()
+                if inner_s.startswith('a:'):
+                    pfx_end = inner.index('a:') + 2
+                    result.append(
+                        inner[:pfx_end] + ' ' +
+                        _flip_poly_winding_data(inner[pfx_end:].strip()) + '\n'
+                    )
+                else:
+                    result.append(inner)
+                depth += inner.count('{') - inner.count('}')
+                j += 1
+            continue
+
+        # [Fix Normals] 取反法线向量（仅 Normals:，不含 NormalsW:）
+        if stripped.startswith('Normals:') and not stripped.startswith('NormalsW:'):
+            result.append(line)
+            j += 1
+            depth = line.count('{') - line.count('}')
+            while j < total_b and depth == 0 and '{' not in block_lines[j]:
+                result.append(block_lines[j])
+                j += 1
+            if j < total_b and depth == 0:
+                result.append(block_lines[j])
+                depth = block_lines[j].count('{') - block_lines[j].count('}')
+                j += 1
+            while j < total_b and depth > 0:
+                inner = block_lines[j]
+                inner_s = inner.strip()
+                if inner_s.startswith('a:'):
+                    pfx_end = inner.index('a:') + 2
+                    result.append(
+                        inner[:pfx_end] + ' ' +
+                        _negate_normals_data(inner[pfx_end:].strip()) + '\n'
+                    )
+                else:
+                    result.append(inner)
+                depth += inner.count('{') - inner.count('}')
+                j += 1
+            continue
+
+        result.append(line)
+        j += 1
+
+    return result
+
 def build_convex_only_fbx(source_fbx, output_fbx):
     with open(source_fbx, 'r', encoding='utf-8', errors='ignore') as f:
         lines = f.readlines()
@@ -233,6 +363,39 @@ def build_convex_only_fbx(source_fbx, output_fbx):
             unreal.log(f"  已掏空原始 Geometry 块 (第 {replaced_count} 个)")
             continue
 
+        # [v10 新增][Fix Normals] 若开启法线反转，收集整个 UCX_ 几何块后统一处理
+        is_ucx_geometry = (
+            FLIP_NORMALS
+            and stripped.startswith('Geometry:')
+            and '"Mesh"' in stripped
+            and 'UCX_' in stripped
+        )
+
+        if is_ucx_geometry:
+            # 收集 UCX_ 块的全部行（首行已做 UCX_ 前缀去除）
+            header_line = _strip_ucx_prefix(lines[i])
+            block = [header_line]
+            if '{' in header_line:
+                depth = header_line.count('{') - header_line.count('}')
+                i += 1
+            else:
+                i += 1
+                while i < total and '{' not in lines[i]:
+                    block.append(lines[i])
+                    i += 1
+                if i < total:
+                    block.append(lines[i])
+                    depth = lines[i].count('{') - lines[i].count('}')
+                    i += 1
+                else:
+                    depth = 0
+            while i < total and depth > 0:
+                block.append(lines[i])
+                depth += lines[i].count('{') - lines[i].count('}')
+                i += 1
+            output.extend(_flip_normals_in_ucx_block(block))
+            continue
+
         # [Fix Bug1] 精确去掉节点声明行中的 UCX_ 前缀
         output.append(_strip_ucx_prefix(lines[i]))
         i += 1
@@ -244,7 +407,8 @@ def build_convex_only_fbx(source_fbx, output_fbx):
         f.writelines(output)
     unreal.log(
         f"  凸包 FBX 生成: 掏空 {replaced_count} 个原始 Geometry，"
-        f"UCX_ 前缀精确替换完成 ({os.path.getsize(output_fbx)/1024:.1f} KB)"
+        f"UCX_ 前缀精确替换完成，法线反转={'已启用' if FLIP_NORMALS else '已关闭'} "
+        f"({os.path.getsize(output_fbx)/1024:.1f} KB)"
     )
     return True
 
@@ -308,6 +472,73 @@ def import_fbx(fbx_path, dest_path, asset_name):
     return False
 
 # ================================================================
+#  [v10 新增] 导出凸包简模为 FBX 或 OBJ 文件
+# ================================================================
+def export_convex_mesh_file(convex_mesh, fmt):
+    """[v10 新增] 将凸包简模导出为 FBX 或 OBJ 文件。"""
+    asset_name = get_asset_name(convex_mesh)
+    export_dir = EXPORT_MESH_DIR if EXPORT_MESH_DIR else TEMP_DIR
+    os.makedirs(export_dir, exist_ok=True)
+    export_path = os.path.join(export_dir, f"{asset_name}.{fmt.lower()}")
+
+    task = unreal.AssetExportTask()
+    task.set_editor_property("object", convex_mesh)
+    task.set_editor_property("filename", export_path)
+    task.set_editor_property("automated", True)
+    task.set_editor_property("prompt", False)
+    task.set_editor_property("replace_identical", True)
+
+    if fmt.lower() == "fbx":
+        options = unreal.FbxExportOption()
+        options.set_editor_property("collision", False)
+        options.set_editor_property("ascii", False)  # 二进制 FBX
+        task.set_editor_property("options", options)
+        task.set_editor_property("exporter", unreal.StaticMeshExporterFBX())
+    elif fmt.lower() == "obj":
+        task.set_editor_property("exporter", unreal.StaticMeshExporterOBJ())
+    else:
+        unreal.log_warning(f"  [v10] 不支持的导出格式: {fmt}，请使用 fbx 或 obj（跳过导出）")
+        return
+
+    ok = unreal.Exporter.run_asset_export_task(task)
+    if ok and os.path.exists(export_path):
+        unreal.log(f"  [v10] 简模导出成功 ({fmt.upper()}): {export_path}")
+    else:
+        unreal.log_error(f"  [v10] 简模导出失败 ({fmt.upper()}): {export_path}")
+
+# ================================================================
+#  [v10 新增] 导出凸包简模为 ABC 单帧
+# ================================================================
+def export_convex_mesh_abc(convex_mesh):
+    """[v10 新增] 将凸包简模导出为 Alembic (.abc) 单帧格式。"""
+    asset_name = get_asset_name(convex_mesh)
+    export_dir = EXPORT_ABC_DIR if EXPORT_ABC_DIR else TEMP_DIR
+    os.makedirs(export_dir, exist_ok=True)
+    export_path = os.path.join(export_dir, f"{asset_name}.abc")
+
+    # 优先尝试 UE 内置 ABC Exporter 类
+    exporter_cls = getattr(unreal, 'StaticMeshExporterABC', None)
+    if exporter_cls is not None:
+        task = unreal.AssetExportTask()
+        task.set_editor_property("object", convex_mesh)
+        task.set_editor_property("filename", export_path)
+        task.set_editor_property("automated", True)
+        task.set_editor_property("prompt", False)
+        task.set_editor_property("replace_identical", True)
+        task.set_editor_property("exporter", exporter_cls())
+        ok = unreal.Exporter.run_asset_export_task(task)
+        if ok and os.path.exists(export_path):
+            unreal.log(f"  [v10] ABC 导出成功: {export_path}")
+        else:
+            unreal.log_error(f"  [v10] ABC 导出失败: {export_path}")
+    else:
+        # UE 5.5 Python 暂不直接支持 ABC 导出，提示手动操作
+        unreal.log_warning(
+            f"  [v10] UE Python 暂不直接支持 ABC 导出（请确认 Alembic 插件已在 UE 5.5 中启用），"
+            f"请在 UE 内容浏览器中右键 → 导出 → Alembic: {asset_name}"
+        )
+
+# ================================================================
 #  创建凸包简模
 # ================================================================
 def create_convex_mesh(static_mesh):
@@ -356,6 +587,7 @@ def get_or_create_convex_mesh(static_mesh):
             unreal.log(f"  ✓ 已有凸包简模（FORCE_RECREATE=False，直接使用）: {convex_path}")
             mesh = unreal.EditorAssetLibrary.load_asset(convex_path)
             if mesh and isinstance(mesh, unreal.StaticMesh):
+                _run_convex_exports(mesh)  # [v10 新增] 按配置导出
                 return (mesh, False)
         else:
             unreal.log(f"  ↺ FORCE_RECREATE=True，删除旧资产并重建: {convex_path}")
@@ -366,8 +598,16 @@ def get_or_create_convex_mesh(static_mesh):
         for try_path in [result_path, convex_path]:
             mesh = unreal.EditorAssetLibrary.load_asset(try_path)
             if mesh and isinstance(mesh, unreal.StaticMesh):
+                _run_convex_exports(mesh)  # [v10 新增] 按配置导出
                 return (mesh, True)
     return (None, False)
+
+def _run_convex_exports(convex_mesh):
+    """[v10 新增] 根据配置将凸包简模导出为 FBX/OBJ 和/或 ABC。"""
+    if EXPORT_MESH_FORMAT:
+        export_convex_mesh_file(convex_mesh, EXPORT_MESH_FORMAT)
+    if EXPORT_ABC:
+        export_convex_mesh_abc(convex_mesh)
 
 # ================================================================
 #  关卡扫描 & 替换
@@ -454,15 +694,20 @@ def process_one_source_mesh(static_mesh, actor_pool):
 
 def main():
     unreal.log("╔══════════════════════════════════════════════════════╗")
-    unreal.log("║  凸包替换工具 v9 (UE 5.5)                           ║")
+    unreal.log("║  凸包替换工具 v10 (UE 5.5)                          ║")
     unreal.log("║  ★ 自动扫描场景 Actor → 收集唯一网格 → 创建并替换   ║")
     unreal.log("║  Ctrl+Z 撤销 | 保留 Transform/材质                  ║")
     unreal.log("╚══════════════════════════════════════════════════════╝")
     unreal.log(
-        f"[v9 配置] HULL_COUNT={AUTO_HULL_COUNT}, MAX_VERTS={AUTO_MAX_HULL_VERTS}, "
+        f"[v10 配置] HULL_COUNT={AUTO_HULL_COUNT}, MAX_VERTS={AUTO_MAX_HULL_VERTS}, "
         f"PRECISION={AUTO_HULL_PRECISION} | "
         f"SELECTED_ONLY={SELECTED_ONLY}, "
         f"FORCE_RECREATE={FORCE_RECREATE}, FORCE_HULL_REGEN={FORCE_HULL_REGEN}"
+    )
+    unreal.log(
+        f"[v10 新增] FLIP_NORMALS={FLIP_NORMALS} | "
+        f"EXPORT_MESH_FORMAT={EXPORT_MESH_FORMAT!r}, EXPORT_MESH_DIR={EXPORT_MESH_DIR!r} | "
+        f"EXPORT_ABC={EXPORT_ABC}, EXPORT_ABC_DIR={EXPORT_ABC_DIR!r}"
     )
 
     # 缓存全部 Actor，供后续各 mesh 复用，避免重复调用 get_all_level_actors
