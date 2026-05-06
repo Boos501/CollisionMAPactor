@@ -13,12 +13,13 @@ SELECTED_ONLY    = False  # True → 只处理视口中当前选中的 Actor；F
 FORCE_RECREATE   = False  # True → 删除旧 _Convex 资产，按当前参数重建
 FORCE_HULL_REGEN = False  # True → 删除旧凸包，按当前参数重新分解
 
-# v10 新增
-FLIP_NORMALS       = True  # True → 反转凸包网格法线（解决内表面问题）  # [v10 新增]
-EXPORT_MESH_FORMAT = ""    # "" / "fbx" / "obj" → 额外导出简模文件      # [v10 新增]
-EXPORT_MESH_DIR    = ""    # 留空使用系统 TEMP 目录                      # [v10 新增]
-EXPORT_ABC         = False # True → 额外导出 ABC 单帧                    # [v10 新增]
-EXPORT_ABC_DIR     = ""    # 留空使用系统 TEMP 目录                      # [v10 新增]
+# v10/v11 新增
+FLIP_NORMALS        = True           # True → 反转凸包网格法线（解决内表面问题）  # [v10 新增]
+EXPORT_MESH_FORMAT  = ""             # "" / "fbx" / "obj" → 合并导出格式          # [v11 语义改为合并导出]
+EXPORT_MESH_DIR     = ""             # 合并 FBX/OBJ 输出目录（留空使用 TEMP_DIR） # [v11]
+EXPORT_ABC          = False          # True → 合并导出单个 ABC 文件               # [v11 语义改为合并导出]
+EXPORT_ABC_DIR      = ""             # 合并 ABC 输出目录（留空使用 TEMP_DIR）      # [v11]
+EXPORT_MERGED_NAME  = "ConvexMerged" # 合并导出文件基础名                          # [v11 新增]
 
 TEMP_DIR = os.path.join(tempfile.gettempdir(), "ue5_convex_extract")
 os.makedirs(TEMP_DIR, exist_ok=True)
@@ -472,10 +473,11 @@ def import_fbx(fbx_path, dest_path, asset_name):
     return False
 
 # ================================================================
-#  [v10 新增] 导出凸包简模为 FBX 或 OBJ 文件
+#  [v10 新增 / v11 Deprecated] 单文件单模型导出 - 已弃用，由合并导出替代
 # ================================================================
 def export_convex_mesh_file(convex_mesh, fmt):
-    """[v10 新增] 将凸包简模导出为 FBX 或 OBJ 文件。"""
+    """[Deprecated v11] 将单个凸包简模导出为 FBX 或 OBJ 文件。
+    v11 起不再被调用，合并导出请使用 export_merged_convex()。"""
     asset_name = get_asset_name(convex_mesh)
     export_dir = EXPORT_MESH_DIR if EXPORT_MESH_DIR else TEMP_DIR
     os.makedirs(export_dir, exist_ok=True)
@@ -491,32 +493,33 @@ def export_convex_mesh_file(convex_mesh, fmt):
     if fmt.lower() == "fbx":
         options = unreal.FbxExportOption()
         options.set_editor_property("collision", False)
-        options.set_editor_property("ascii", False)  # 二进制 FBX
+        options.set_editor_property("ascii", False)
         task.set_editor_property("options", options)
         task.set_editor_property("exporter", unreal.StaticMeshExporterFBX())
     elif fmt.lower() == "obj":
         task.set_editor_property("exporter", unreal.StaticMeshExporterOBJ())
     else:
-        unreal.log_warning(f"  [v10] 不支持的导出格式: {fmt}，请使用 fbx 或 obj（跳过导出）")
+        unreal.log_warning(f"  [Deprecated] 不支持的导出格式: {fmt}，请使用 fbx 或 obj（跳过导出）")
         return
 
     ok = unreal.Exporter.run_asset_export_task(task)
     if ok and os.path.exists(export_path):
-        unreal.log(f"  [v10] 简模导出成功 ({fmt.upper()}): {export_path}")
+        unreal.log(f"  [Deprecated] 简模导出成功 ({fmt.upper()}): {export_path}")
     else:
-        unreal.log_error(f"  [v10] 简模导出失败 ({fmt.upper()}): {export_path}")
+        unreal.log_error(f"  [Deprecated] 简模导出失败 ({fmt.upper()}): {export_path}")
 
 # ================================================================
-#  [v10 新增] 导出凸包简模为 ABC 单帧
+#  [v10 新增 / v11 Deprecated] 单文件 ABC 导出 - 已弃用
 # ================================================================
 def export_convex_mesh_abc(convex_mesh):
-    """[v10 新增] 将凸包简模导出为 Alembic (.abc) 单帧格式。"""
+    """[Deprecated v11] 将单个凸包简模导出为 Alembic (.abc) 单帧格式。
+    v11 起不再被调用，合并导出请使用 export_merged_convex_abc()。"""
     asset_name = get_asset_name(convex_mesh)
     export_dir = EXPORT_ABC_DIR if EXPORT_ABC_DIR else TEMP_DIR
     os.makedirs(export_dir, exist_ok=True)
     export_path = os.path.join(export_dir, f"{asset_name}.abc")
 
-    # 优先尝试 UE 内置 ABC Exporter 类
+    # Deprecated: StaticMeshExporterABC 在 UE 5.5 不存在，永远走 else 分支
     exporter_cls = getattr(unreal, 'StaticMeshExporterABC', None)
     if exporter_cls is not None:
         task = unreal.AssetExportTask()
@@ -528,15 +531,193 @@ def export_convex_mesh_abc(convex_mesh):
         task.set_editor_property("exporter", exporter_cls())
         ok = unreal.Exporter.run_asset_export_task(task)
         if ok and os.path.exists(export_path):
-            unreal.log(f"  [v10] ABC 导出成功: {export_path}")
+            unreal.log(f"  [Deprecated] ABC 导出成功: {export_path}")
         else:
-            unreal.log_error(f"  [v10] ABC 导出失败: {export_path}")
+            unreal.log_error(f"  [Deprecated] ABC 导出失败: {export_path}")
     else:
-        # UE 5.5 Python 暂不直接支持 ABC 导出，提示手动操作
         unreal.log_warning(
-            f"  [v10] UE Python 暂不直接支持 ABC 导出（请确认 Alembic 插件已在 UE 5.5 中启用），"
+            f"  [Deprecated] UE Python 暂不直接支持 ABC 导出，"
             f"请在 UE 内容浏览器中右键 → 导出 → Alembic: {asset_name}"
         )
+
+# ================================================================
+#  [v11 新增] 获取编辑器世界（优先 UnrealEditorSubsystem，回退 EditorLevelLibrary）
+# ================================================================
+def _get_editor_world():
+    """优先使用 UnrealEditorSubsystem.get_editor_world()（UE 5.5+），
+    若不可用则回退到 EditorLevelLibrary.get_editor_world()。"""
+    ues_cls = getattr(unreal, 'UnrealEditorSubsystem', None)
+    if ues_cls is not None:
+        try:
+            return unreal.get_editor_subsystem(ues_cls).get_editor_world()
+        except Exception:
+            pass
+    ell = getattr(unreal, 'EditorLevelLibrary', None)
+    if ell is not None:
+        try:
+            return ell.get_editor_world()
+        except Exception:
+            pass
+    unreal.log_error("  [v11] 无法获取编辑器世界，UnrealEditorSubsystem 和 EditorLevelLibrary 均不可用")
+    return None
+
+# ================================================================
+#  [v11 新增] Actor 去重辅助函数
+# ================================================================
+def _unique_actors(actor_component_pairs):
+    """从 (actor, component) 列表中提取唯一 Actor，优先用对象本身作哈希键，
+    回退到 id() 以兼容不可哈希的情况。"""
+    try:
+        return list({actor: None for actor, _comp in actor_component_pairs}.keys())
+    except TypeError:
+        seen = {}
+        for actor, _comp in actor_component_pairs:
+            seen[id(actor)] = actor
+        return list(seen.values())
+
+# ================================================================
+#  [v11 新增] 合并导出所有被替换 Actor 为单个 FBX 或 OBJ 文件
+# ================================================================
+def export_merged_convex(replaced_actor_components, fmt):
+    """[v11 新增] 将所有被替换为 _Convex 简模的 Actor 合并导出到单个 FBX/OBJ 文件。
+    使用 LevelExporterFBX/LevelExporterOBJ 以保留各 Actor 的世界 Transform。"""
+    if not replaced_actor_components:
+        unreal.log_warning("  [v11] 无已替换的 Actor，跳过合并导出")
+        return
+
+    fmt_lower = fmt.lower()
+    if fmt_lower == "fbx":
+        exporter_cls = getattr(unreal, 'LevelExporterFBX', None)
+    elif fmt_lower == "obj":
+        exporter_cls = getattr(unreal, 'LevelExporterOBJ', None)
+    else:
+        unreal.log_warning(f"  [v11] 不支持的合并导出格式: {fmt}，请使用 fbx 或 obj")
+        return
+
+    if exporter_cls is None:
+        unreal.log_error(f"  [v11] unreal.{('LevelExporterFBX' if fmt_lower == 'fbx' else 'LevelExporterOBJ')} 不可用，跳过合并导出")
+        return
+
+    world = _get_editor_world()
+    if world is None:
+        return
+
+    export_dir = EXPORT_MESH_DIR if EXPORT_MESH_DIR else TEMP_DIR
+    os.makedirs(export_dir, exist_ok=True)
+    export_path = os.path.join(export_dir, f"{EXPORT_MERGED_NAME}.{fmt_lower}")
+
+    # 提取唯一 Actor 列表
+    actors_to_export = _unique_actors(replaced_actor_components)
+
+    # 保存当前选中集合，导出后还原
+    editor_actor_sub = unreal.get_editor_subsystem(unreal.EditorActorSubsystem)
+    prev_selected = list(editor_actor_sub.get_selected_level_actors())
+    try:
+        editor_actor_sub.set_selected_level_actors(actors_to_export)
+
+        task = unreal.AssetExportTask()
+        task.set_editor_property("object", world)
+        task.set_editor_property("filename", export_path)
+        task.set_editor_property("automated", True)
+        task.set_editor_property("prompt", False)
+        task.set_editor_property("replace_identical", True)
+        task.set_editor_property("selected", True)
+        task.set_editor_property("exporter", exporter_cls())
+
+        if fmt_lower == "fbx":
+            options = unreal.FbxExportOption()
+            options.set_editor_property("ascii", False)
+            options.set_editor_property("collision", False)
+            options.set_editor_property("level_of_detail", False)
+            task.set_editor_property("options", options)
+
+        ok = unreal.Exporter.run_asset_export_task(task)
+        if ok and os.path.exists(export_path):
+            size_kb = os.path.getsize(export_path) / 1024
+            unreal.log(
+                f"  [v11] 合并导出成功 ({fmt.upper()})，共 {len(actors_to_export)} 个 Actor，"
+                f"包含世界 Transform: {export_path} ({size_kb:.1f} KB)"
+            )
+        else:
+            unreal.log_error(f"  [v11] 合并导出失败 ({fmt.upper()}): {export_path}")
+    finally:
+        editor_actor_sub.set_selected_level_actors(prev_selected)
+
+# ================================================================
+#  [v11 新增] 合并导出所有被替换 Actor 为单个 ABC 文件
+# ================================================================
+def export_merged_convex_abc(replaced_actor_components):
+    """[v11 新增] 将所有被替换为 _Convex 简模的 Actor 合并导出到单个 ABC 文件。
+    按优先级探测可用的 Alembic Exporter 类：AlembicExporter → 任何含 Alembic 的 Exporter 子类。
+    若均不可用则给出明确的手动导出指引，不再静默失败。"""
+    if not replaced_actor_components:
+        unreal.log_warning("  [v11] 无已替换的 Actor，跳过 ABC 合并导出")
+        return
+
+    # 1. 优先探测 unreal.AlembicExporter
+    exporter_cls = getattr(unreal, 'AlembicExporter', None)
+
+    # 2. 若不存在，扫描 dir(unreal) 中所有名称含 Alembic 且是 unreal.Exporter 子类的类
+    if exporter_cls is None:
+        for attr_name in dir(unreal):
+            if 'alembic' not in attr_name.lower():
+                continue
+            cls = getattr(unreal, attr_name, None)
+            if cls is None:
+                continue
+            try:
+                if isinstance(cls, type) and issubclass(cls, unreal.Exporter):
+                    exporter_cls = cls
+                    unreal.log(f"  [v11] 探测到 Alembic Exporter: unreal.{attr_name}")
+                    break
+            except TypeError:
+                # issubclass 对非类型对象会抛 TypeError，安全跳过
+                continue
+
+    if exporter_cls is None:
+        unreal.log_warning(
+            "  [v11] UE 5.5 默认 Python API 未暴露 Alembic Exporter 类，无法自动导出 ABC。\n"
+            "  建议：\n"
+            "    1. 在 UE 编辑器中选中所有 _Convex Actor → File → Export Selected... → 选择 .abc 格式手动导出；\n"
+            "    2. 或在 插件管理器 中启用 'AlembicImporter' 插件后重启编辑器再试。"
+        )
+        return
+
+    world = _get_editor_world()
+    if world is None:
+        return
+
+    export_dir = EXPORT_ABC_DIR if EXPORT_ABC_DIR else TEMP_DIR
+    os.makedirs(export_dir, exist_ok=True)
+    export_path = os.path.join(export_dir, f"{EXPORT_MERGED_NAME}.abc")
+
+    actors_to_export = _unique_actors(replaced_actor_components)
+
+    editor_actor_sub = unreal.get_editor_subsystem(unreal.EditorActorSubsystem)
+    prev_selected = list(editor_actor_sub.get_selected_level_actors())
+    try:
+        editor_actor_sub.set_selected_level_actors(actors_to_export)
+
+        task = unreal.AssetExportTask()
+        task.set_editor_property("object", world)
+        task.set_editor_property("filename", export_path)
+        task.set_editor_property("automated", True)
+        task.set_editor_property("prompt", False)
+        task.set_editor_property("replace_identical", True)
+        task.set_editor_property("selected", True)
+        task.set_editor_property("exporter", exporter_cls())
+
+        ok = unreal.Exporter.run_asset_export_task(task)
+        if ok and os.path.exists(export_path):
+            size_kb = os.path.getsize(export_path) / 1024
+            unreal.log(
+                f"  [v11] ABC 合并导出成功，共 {len(actors_to_export)} 个 Actor: "
+                f"{export_path} ({size_kb:.1f} KB)"
+            )
+        else:
+            unreal.log_error(f"  [v11] ABC 合并导出失败: {export_path}")
+    finally:
+        editor_actor_sub.set_selected_level_actors(prev_selected)
 
 # ================================================================
 #  创建凸包简模
@@ -587,7 +768,6 @@ def get_or_create_convex_mesh(static_mesh):
             unreal.log(f"  ✓ 已有凸包简模（FORCE_RECREATE=False，直接使用）: {convex_path}")
             mesh = unreal.EditorAssetLibrary.load_asset(convex_path)
             if mesh and isinstance(mesh, unreal.StaticMesh):
-                _run_convex_exports(mesh)  # [v10 新增] 按配置导出
                 return (mesh, False)
         else:
             unreal.log(f"  ↺ FORCE_RECREATE=True，删除旧资产并重建: {convex_path}")
@@ -598,7 +778,6 @@ def get_or_create_convex_mesh(static_mesh):
         for try_path in [result_path, convex_path]:
             mesh = unreal.EditorAssetLibrary.load_asset(try_path)
             if mesh and isinstance(mesh, unreal.StaticMesh):
-                _run_convex_exports(mesh)  # [v10 新增] 按配置导出
                 return (mesh, True)
     return (None, False)
 
@@ -665,7 +844,7 @@ def process_one_source_mesh(static_mesh, actor_pool):
     convex_mesh, was_created = get_or_create_convex_mesh(static_mesh)
     if convex_mesh is None:
         unreal.log_error(f"  ❌ 凸包简模创建失败")
-        return (0, 0)
+        return (0, 0, [])
     status = "新创建" if was_created else "已有"
     unreal.log(f"  ✓ 凸包简模 ({status}): {get_asset_name(convex_mesh)}")
 
@@ -673,28 +852,30 @@ def process_one_source_mesh(static_mesh, actor_pool):
     actors = find_actors_using_mesh(static_mesh, actor_pool)
     if not actors:
         unreal.log(f"  关卡中没有使用 {name} 的 Actor")
-        return (0, 0)
+        return (0, 0, [])
     unreal.log(f"  找到 {len(actors)} 个 Actor/组件")
 
     # 3. 替换（支持 Ctrl+Z 撤销）
-    replaced = 0
-    failed   = 0
+    replaced      = 0
+    failed        = 0
+    replaced_pairs = []
     with unreal.ScopedEditorTransaction("Replace With Convex") as trans:
         for actor, comp in actors:
             try:
                 aname = replace_actor_mesh(actor, comp, convex_mesh)
                 replaced += 1
+                replaced_pairs.append((actor, comp))
                 unreal.log(f"    ✓ {aname}")
             except Exception as e:
                 failed += 1
                 unreal.log_error(f"    ✗ {e}")
     unreal.log(f"  替换: {replaced} 成功, {failed} 失败")
-    return (replaced, failed)
+    return (replaced, failed, replaced_pairs)
 
 
 def main():
     unreal.log("╔══════════════════════════════════════════════════════╗")
-    unreal.log("║  凸包替换工具 v10 (UE 5.5)                          ║")
+    unreal.log("║  凸包替换工具 v11 (UE 5.5)                          ║")
     unreal.log("║  ★ 自动扫描场景 Actor → 收集唯一网格 → 创建并替换   ║")
     unreal.log("║  Ctrl+Z 撤销 | 保留 Transform/材质                  ║")
     unreal.log("╚══════════════════════════════════════════════════════╝")
@@ -708,6 +889,12 @@ def main():
         f"[v10 新增] FLIP_NORMALS={FLIP_NORMALS} | "
         f"EXPORT_MESH_FORMAT={EXPORT_MESH_FORMAT!r}, EXPORT_MESH_DIR={EXPORT_MESH_DIR!r} | "
         f"EXPORT_ABC={EXPORT_ABC}, EXPORT_ABC_DIR={EXPORT_ABC_DIR!r}"
+    )
+    unreal.log(
+        f"[v11 合并导出] 所有 _Convex 实例将合并到单一文件并保留世界 Transform | "
+        f"EXPORT_MERGED_NAME={EXPORT_MERGED_NAME!r} | "
+        f"导出格式={repr(EXPORT_MESH_FORMAT) if EXPORT_MESH_FORMAT else '(不导出)'}, "
+        f"ABC={'是' if EXPORT_ABC else '否'}"
     )
 
     # 缓存全部 Actor，供后续各 mesh 复用，避免重复调用 get_all_level_actors
@@ -746,6 +933,7 @@ def main():
 
     total_replaced = 0
     total_failed   = 0
+    replaced_pairs = []  # [v11] 收集所有已替换的 (actor, component)
     with unreal.ScopedSlowTask(len(meshes), "处理中...") as slow_task:
         slow_task.make_dialog(True)
         for mesh in meshes:
@@ -753,14 +941,27 @@ def main():
                 unreal.log("  ⚠ 用户取消操作")
                 break
             slow_task.enter_progress_frame(1, f"处理: {get_asset_name(mesh)}")
-            r, f = process_one_source_mesh(mesh, actor_pool)
+            r, f, pairs = process_one_source_mesh(mesh, actor_pool)
             total_replaced += r
             total_failed   += f
+            replaced_pairs.extend(pairs)
 
     unreal.log(f"\n{'═'*60}")
     unreal.log(f"  完成! 替换: {total_replaced} 成功, {total_failed} 失败")
     unreal.log(f"  Ctrl+Z 可撤销全部替换")
     unreal.log(f"{'═'*60}")
+
+    # [v11] 所有替换完成后，统一执行合并导出
+    if replaced_pairs:
+        if EXPORT_MESH_FORMAT:
+            unreal.log(f"\n[v11] 开始合并导出 {len(replaced_pairs)} 个 Actor → {EXPORT_MESH_FORMAT.upper()}...")
+            export_merged_convex(replaced_pairs, EXPORT_MESH_FORMAT)
+        if EXPORT_ABC:
+            unreal.log(f"\n[v11] 开始合并导出 {len(replaced_pairs)} 个 Actor → ABC...")
+            export_merged_convex_abc(replaced_pairs)
+    else:
+        if EXPORT_MESH_FORMAT or EXPORT_ABC:
+            unreal.log_warning("[v11] 没有成功替换的 Actor，跳过合并导出")
 
 
 main()
