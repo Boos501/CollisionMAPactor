@@ -1,5 +1,4 @@
-LogBlueprintUserMessages: [凸包转模型简模用_C_1] """
-UE 5.5 - 关卡 Actor 凸包替换工具 v7
+"""UE 5.5 - 关卡 Actor 凸包替换工具 v7
 =====================================
 核心修复：原始 Geometry 替换为微型占位三角形 + 去掉 UCX_ 前缀
          → FBX 结构 100% 完整 → 导入只显示凸包几何体
@@ -404,5 +403,3 @@ def main():
     unreal.log(f"  Ctrl+Z 可撤销全部替换")
     unreal.log(f"{'═'*60}")
 main()
-LogDerivedDataCache: C:/Users/uezfl/AppData/Local/UnrealEngine/Common/DerivedDataCache: Maintenance finished in +00:00:00.172 and deleted 0 files with total size 0 MiB and 0 empty folders. Scanned 855 files in 1407 folders with total size 100 MiB.
-LogUObjectHash: Compacting FUObjectHashTables data took   0.83ms
