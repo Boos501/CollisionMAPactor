@@ -163,6 +163,11 @@ def export_fbx_ascii(static_mesh, fbx_path):
     options = unreal.FbxExportOption()
     options.set_editor_property("collision", True)
     options.set_editor_property("ascii", True)
+    # ★ [Fix Scale] 关闭 LOD 导出，避免 LOD0 与高模缩放不一致引入尺寸偏差 ★
+    try:
+        options.set_editor_property("level_of_detail", False)
+    except Exception:
+        pass
     task.set_editor_property("options", options)
     task.set_editor_property("exporter", unreal.StaticMeshExporterFBX())
     ok = unreal.Exporter.run_asset_export_task(task)
@@ -416,6 +421,14 @@ def build_convex_only_fbx(source_fbx, output_fbx):
 #  FBX 导入
 # ================================================================
 def import_fbx(fbx_path, dest_path, asset_name):
+    def _safe_set_property(obj, prop_name, value):
+        try:
+            obj.set_editor_property(prop_name, value)
+            return True
+        except Exception as e:
+            unreal.log_warning(f"  [Fix Scale] 属性 {prop_name} 设置失败（可能版本不支持）: {e}")
+            return False
+
     task = unreal.AssetImportTask()
     task.set_editor_property("filename", fbx_path)
     task.set_editor_property("destination_path", dest_path)
@@ -433,6 +446,16 @@ def import_fbx(fbx_path, dest_path, asset_name):
     sm_data.set_editor_property("combine_meshes", True)
     sm_data.set_editor_property("auto_generate_collision", False)
     sm_data.set_editor_property("generate_lightmap_u_vs", False)
+    # ★ [Fix Scale] 锁定缩放与坐标系，避免源 FBX 是从 UE 自己导出后再次导入时被二次转换 ★
+    _safe_set_property(sm_data, "import_uniform_scale", 1.0)
+    _safe_set_property(sm_data, "import_translation", unreal.Vector(0.0, 0.0, 0.0))
+    _safe_set_property(sm_data, "import_rotation", unreal.Rotator(0.0, 0.0, 0.0))
+    # 源 FBX 已是 UE 坐标系，关闭场景与单位转换，避免二次缩放/翻转
+    _safe_set_property(sm_data, "convert_scene", False)
+    _safe_set_property(sm_data, "convert_scene_unit", False)
+    _safe_set_property(sm_data, "force_front_x_axis", False)
+    # Build 阶段不再额外缩放
+    _safe_set_property(sm_data, "build_scale3d", unreal.Vector(1.0, 1.0, 1.0))
     task.set_editor_property("options", options)
 
     unreal.AssetToolsHelpers.get_asset_tools().import_asset_tasks([task])
@@ -659,6 +682,13 @@ def process_one_source_mesh(static_mesh, actor_pool):
     unreal.log(f"\n{'═'*60}")
     unreal.log(f"  源模型: {name}")
     unreal.log(f"  路径:   {pkg}")
+    # ★ [Fix Scale] 诊断：打印源模型包围盒尺寸，方便定位缩放异常 ★
+    try:
+        src_bounds = static_mesh.get_bounds()
+        src_size = src_bounds.box_extent * 2.0
+        unreal.log(f"  [诊断] 源包围盒尺寸 (cm): X={src_size.x:.2f}, Y={src_size.y:.2f}, Z={src_size.z:.2f}")
+    except Exception as e:
+        unreal.log_warning(f"  [诊断] 读取源包围盒失败: {e}")
     unreal.log(f"{'═'*60}")
 
     # 1. 获取/创建凸包简模
@@ -668,6 +698,26 @@ def process_one_source_mesh(static_mesh, actor_pool):
         return (0, 0)
     status = "新创建" if was_created else "已有"
     unreal.log(f"  ✓ 凸包简模 ({status}): {get_asset_name(convex_mesh)}")
+    # ★ [Fix Scale] 诊断：打印简模包围盒尺寸并与源对比 ★
+    try:
+        cv_bounds = convex_mesh.get_bounds()
+        cv_size = cv_bounds.box_extent * 2.0
+        unreal.log(f"  [诊断] 简模包围盒尺寸 (cm): X={cv_size.x:.2f}, Y={cv_size.y:.2f}, Z={cv_size.z:.2f}")
+        # 若任一轴 < 源尺寸 80% 则警告
+        try:
+            ratio_x = cv_size.x / src_size.x if src_size.x > 0.001 else 1.0
+            ratio_y = cv_size.y / src_size.y if src_size.y > 0.001 else 1.0
+            ratio_z = cv_size.z / src_size.z if src_size.z > 0.001 else 1.0
+            min_ratio = min(ratio_x, ratio_y, ratio_z)
+            if min_ratio < 0.8:
+                unreal.log_warning(
+                    f"  ⚠ [Fix Scale] 简模尺寸明显小于源 (最小轴比 {min_ratio:.2f})！"
+                    f" 比例 X={ratio_x:.2f}, Y={ratio_y:.2f}, Z={ratio_z:.2f}"
+                )
+        except NameError:
+            pass
+    except Exception as e:
+        unreal.log_warning(f"  [诊断] 读取简模包围盒失败: {e}")
 
     # 2. 在缓存的 actor_pool 中找目标 Actor（避免重复扫描关卡）
     actors = find_actors_using_mesh(static_mesh, actor_pool)
@@ -694,10 +744,11 @@ def process_one_source_mesh(static_mesh, actor_pool):
 
 def main():
     unreal.log("╔══════════════════════════════════════════════════════╗")
-    unreal.log("║  凸包替换工具 v10 (UE 5.5)                          ║")
+    unreal.log("║  凸包替换工具 v11.1 (UE 5.5) [Fix Scale]            ║")
     unreal.log("║  ★ 自动扫描场景 Actor → 收集唯一网格 → 创建并替换   ║")
     unreal.log("║  Ctrl+Z 撤销 | 保留 Transform/材质                  ║")
     unreal.log("╚══════════════════════════════════════════════════════╝")
+    unreal.log("[v11.1 Fix Scale] 修复部分场景凸包导入后变小的问题：锁定 import_uniform_scale=1、convert_scene=False、convert_scene_unit=False，关闭 LOD 导出，新增包围盒诊断日志")
     unreal.log(
         f"[v10 配置] HULL_COUNT={AUTO_HULL_COUNT}, MAX_VERTS={AUTO_MAX_HULL_VERTS}, "
         f"PRECISION={AUTO_HULL_PRECISION} | "
